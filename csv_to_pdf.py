@@ -2,6 +2,9 @@ import os
 import glob
 import re
 import pandas as pd
+import urllib.request
+import shutil
+import tempfile
 from reportlab.lib import colors
 from reportlab.lib.units import inch
 from reportlab.lib.pagesizes import A4
@@ -30,6 +33,65 @@ PADDING = 6
 
 def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "", str(name)).replace(" ", "_")
+
+def download_signature_from_gdrive(url):
+    """Downloads an image from a Google Drive URL to a temp file, trying multiple strategies."""
+    try:
+        url = str(url).strip()
+        if not url or url.lower() == 'nan' or not url.startswith('http'):
+            return None
+            
+        file_id = None
+        match = re.search(r'(?:id=|[d]/|file/d/|open\?id=)([a-zA-Z0-9_-]+)', url)
+        if match:
+            file_id = match.group(1)
+        
+        if not file_id:
+            return None
+            
+        # Strategy 1: uc?export=download
+        download_urls = [
+            f'https://drive.google.com/uc?export=download&id={file_id}',
+            f'https://drive.google.com/uc?id={file_id}&export=download',
+            f'https://drive.google.com/thumbnail?id={file_id}&sz=w1000' # Thumbnail can sometimes bypass restrictions
+        ]
+        
+        tmp_path = None
+        for d_url in download_urls:
+            try:
+                # Create temp file
+                tmp_fd, current_tmp = tempfile.mkstemp(suffix='.jpg')
+                os.close(tmp_fd)
+                
+                req = urllib.request.Request(d_url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    content = response.read()
+                    
+                    # Handle confirmation page
+                    if b'confirm=' in content:
+                        confirm_token = re.search(r'confirm=([a-zA-Z0-9_-]+)', content.decode('utf-8', errors='ignore'))
+                        if confirm_token:
+                            d_url_confirm = d_url + f"&confirm={confirm_token.group(1)}"
+                            req = urllib.request.Request(d_url_confirm, headers={'User-Agent': 'Mozilla/5.0'})
+                            with urllib.request.urlopen(req, timeout=10) as response2:
+                                content = response2.read()
+                    
+                    # Check if valid image
+                    if (content.startswith(b'\xff\xd8') or content.startswith(b'\x89PNG') or 
+                        content.startswith(b'GIF87a') or content.startswith(b'GIF89a')):
+                        with open(current_tmp, 'wb') as out_file:
+                            out_file.write(content)
+                        tmp_path = current_tmp
+                        break # Success
+                    else:
+                        os.remove(current_tmp)
+            except Exception:
+                continue
+                
+        return tmp_path
+    except Exception as e:
+        print(f"Error in download_signature_from_gdrive: {e}")
+        return None
 
 def get_clean_title(filename):
     """Extracts 'PRE-EXAM REPORT' from 'PRE-EXAM REPORT (Responses)...'"""
@@ -109,18 +171,6 @@ def create_footer_flowables(observer_info, page_width):
     """
     styles = getSampleStyleSheet()
     
-    # Style for the labels (Signature, Name, etc.)
-    # We use non-breaking spaces or a table structure inside the paragraph to ensure alignment?
-    # Actually, a simple paragraph with breaks <br/> is fine if container is wide enough.
-    style_obs = ParagraphStyle(
-        'FooterObs', 
-        parent=styles['Normal'], 
-        alignment=TA_LEFT, 
-        leading=18, 
-        fontSize=10,
-        fontName='Helvetica'
-    )
-    
     style_date = ParagraphStyle(
         'FooterDate', 
         parent=styles['Normal'], 
@@ -129,45 +179,93 @@ def create_footer_flowables(observer_info, page_width):
         fontSize=10,
         fontName='Helvetica-Bold'
     )
+
+    style_label = ParagraphStyle(
+        'LabelStyle',
+        parent=styles['Normal'],
+        fontSize=10,
+        fontName='Helvetica-Bold',
+        alignment=TA_LEFT
+    )
+
+    style_value = ParagraphStyle(
+        'ValueStyle',
+        parent=styles['Normal'],
+        fontSize=10,
+        fontName='Helvetica',
+        alignment=TA_LEFT
+    )
+
+    style_value_large = ParagraphStyle(
+        'ValueStyleLarge',
+        parent=styles['Normal'],
+        fontSize=12,
+        fontName='Helvetica-Bold',
+        alignment=TA_LEFT
+    )
     
-    # Observer details block
-    # Using specific spacing and underlining placeholders
-    obs_text = f"""
-    <br/>
-    <b>Signature of Observer:</b> ________________________<br/><br/>
-    <b>Name:</b> {observer_info.get('name', '')}<br/><br/>
-    <b>Mobile Number:</b> ________________________<br/><br/>
-    <b>Exam Venue:</b> {observer_info.get('venue', '')}
-    """
+    # 1. Signature Handling
+    sig_path = observer_info.get('signature_path')
+    sig_img = None
+    if sig_path and os.path.exists(sig_path):
+        try:
+            from PIL import Image
+            img = Image.open(sig_path)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            fd, new_sig_path = tempfile.mkstemp(suffix='.png')
+            os.close(fd)
+            img.save(new_sig_path, format='PNG')
+            sig_img = f'<img src="{new_sig_path}" width="80" height="30" valign="bottom" />'
+        except:
+            sig_img = None
+
+    # Helper to create underlined cell content
+    def get_underlined_para(text, style, min_width_chars=40):
+        # We use a fixed-width underline by padding with non-breaking spaces
+        padding = "&nbsp;" * max(0, min_width_chars - len(str(text)))
+        return Paragraph(f"<u>&nbsp;{text}{padding}</u>", style)
+
+    name_val = observer_info.get('name', '')
+    venue_val = observer_info.get('venue', '')
+    mobile_val = observer_info.get('mobile', '')
     
+    # Constructing the Inner Table for Right Side
+    # Column 1: Labels, Column 2: Underlined Values
+    inner_data = [
+        [Paragraph("Signature of Observer:", style_label), get_underlined_para(sig_img if sig_img else "", style_value, 35)],
+        [Paragraph("Name:", style_label), get_underlined_para(name_val, style_value_large, 35)],
+        [Paragraph("Mobile Number:", style_label), get_underlined_para(mobile_val, style_value, 35)],
+        [Paragraph("Exam Venue:", style_label), get_underlined_para(venue_val, style_value_large, 35)]
+    ]
+    
+    # Widths for inner table (approx 300 points total)
+    t_inner = Table(inner_data, colWidths=[110, 190])
+    t_inner.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'BOTTOM'),
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+    ]))
+
     date_text = f"<br/><br/><br/><br/><b>Date:</b> {observer_info.get('date', '')}"
-    
     p_date = Paragraph(date_text, style_date)
-    p_obs = Paragraph(obs_text, style_obs)
     
-    # Layout Table for Footer
-    # Page width is A4 (approx 595 points)
-    # Margins are 40 left/right. Usable ~515 points.
+    # Main Footer Layout
     usable_width = page_width - 80
+    col1_w = usable_width * 0.30
+    col2_w = usable_width * 0.70
     
-    # We want the observer block on the right.
-    # Let's split 40% Left (Date), 60% Right (Observer)
-    col1_w = usable_width * 0.40
-    col2_w = usable_width * 0.60
-    
-    footer_data = [[p_date, p_obs]]
-    
+    footer_data = [[p_date, t_inner]]
     t_footer = Table(footer_data, colWidths=[col1_w, col2_w])
     t_footer.setStyle(TableStyle([
-        ('VALIGN', (0,0), (-1,-1), 'BOTTOM'), # Align everything to bottom initially? No, obs needs top alignment relative to itself
-        ('VALIGN', (0,0), (0,0), 'BOTTOM'),   # Date at bottom left
-        ('VALIGN', (1,0), (1,0), 'TOP'),      # Observer block starts at top
-        ('LEFTPADDING', (0,0), (0,0), 0),     # Date flush left
-        ('LEFTPADDING', (1,0), (1,0), 40),    # Push observer block slightly to separate
-        ('RIGHTPADDING', (1,0), (1,0), 0),
+        ('VALIGN', (0,0), (0,0), 'BOTTOM'),
+        ('VALIGN', (1,0), (1,0), 'TOP'),
+        ('LEFTPADDING', (0,0), (0,0), 0),
+        ('ALIGN', (1,0), (1,0), 'RIGHT'), # Align the inner table container to the right
     ]))
     
-    return [Spacer(1, 0.6*inch), t_footer]
+    return [Spacer(1, 0.4*inch), t_footer]
 
 def get_wrapped_text(text, style=None):
     """Wraps text in a Paragraph object to ensure it wraps inside table cells."""
@@ -339,6 +437,8 @@ def convert_file_to_pdf(file_path):
     col_name = find_key(['name :', 'candidate name', 'name of candidate', 'name'])
     col_venue = find_key(['name of exam venue', 'venue', 'center'])
     col_date = find_key(['timestamp', 'date'])
+    col_signature = find_key(['signature', 'upload signature', 'observer signature'])
+    col_mobile = find_key(['mobile', 'phone', 'contact'])
     
     naming_cols = [col for col in df.columns if any(x in str(col).lower() for x in ['name', 'candidate', 'id'])]
 
@@ -348,15 +448,29 @@ def convert_file_to_pdf(file_path):
         footer_name = str(row[col_name]) if col_name else ""
         footer_venue = str(row[col_venue]) if col_venue else ""
         footer_date = str(row[col_date]) if col_date else ""
+        footer_mobile = str(row[col_mobile]) if col_mobile else ""
         
-        observer_info = {'name': footer_name, 'venue': footer_venue, 'date': footer_date}
+        # Clean mobile if it is NaN
+        if footer_mobile.lower() == 'nan': footer_mobile = ""
+
+        # Handle Signature
+        sig_url = str(row[col_signature]) if col_signature else None
+        sig_path = download_signature_from_gdrive(sig_url)
+        
+        observer_info = {
+            'name': footer_name, 
+            'venue': footer_venue, 
+            'date': footer_date, 
+            'signature_path': sig_path,
+            'mobile': footer_mobile
+        }
 
         # Header Row (Strings)
         table_data = [["Sl. No.", "Particulars", "Response"]]
         
         counter = 1
         for schema in schemas:
-            if schema in [col_name, col_venue, col_date]:
+            if schema in [col_name, col_venue, col_date, col_signature, col_mobile]:
                 continue
                 
             p_clean = clean_particulars(schema)
